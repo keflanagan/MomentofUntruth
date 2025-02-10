@@ -18,7 +18,7 @@ Place and extract into `UniVTG-NA/data/{dataset}`
 
 hdf5 files for faster dataloading may be generated with `data/create_h5py.py`
 
-Place the hdf5 feature files (`txt_clip.hdf5`, `vid_slowfast.hdf5`, `vid_clip.hdf`5) in `UniVTG-NA/data/h5py/{dataset}`
+Place the hdf5 feature files (`txt_clip.hdf5`, `vid_slowfast.hdf5`, `vid_clip.hdf5`) in `UniVTG-NA/data/h5py/{dataset}`
 
 ## Preparation
 
@@ -34,13 +34,11 @@ Place the trained model checkpoints in the dir `UniVTG-NA/results/mr-{dataset}/f
 
 ## Training
 
-The following should all be run from the `UniVTG-NA` directory.
-
-Set `--resume` to the path to the pretrained model in the train bash script
+Set `--resume` to the path to the pretrained model in the train bash script as follows
 
 `resume=./results/pretrained_only/model_best.ckpt`
 
-Run training with
+From the `UniVTG-NA` directory, run training with
 
 `bash scripts/qvhl_train.sh`
 
