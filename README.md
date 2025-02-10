@@ -22,7 +22,11 @@ Place the hdf5 feature files (`txt_clip.hdf5`, `vid_slowfast.hdf5`, `vid_clip.hd
 
 ## Preparation
 
-Set up an environment and install dependencies with `pip install -r requirements.txt`
+Set up an environment and install dependencies with 
+
+```
+pip install -r requirements.txt
+```
 
 Pretrained model checkpoint can be downloaded [here](https://drive.google.com/drive/folders/1eWpuTTBRaMoV4UsEteQHAf5t4dU7uwrl)
 
@@ -39,8 +43,9 @@ Set `--resume` to the path to the pretrained model in the train bash script as f
 `resume=./results/pretrained_only/model_best.ckpt`
 
 From the `UniVTG-NA` directory, run training with
-
-`bash scripts/qvhl_train.sh`
+```
+bash scripts/qvhl_train.sh
+```
 
 Set the `in_coef` and `out_coef` parameters in the `qvhl_train.sh` script to adjust the weighting of the in-domain and out-of-domain losses
 
@@ -51,9 +56,10 @@ Set `--resume` to the path to the model checkpoint in the train bash script
 `resume=./results/mr-qvhighlights/finetuned/model_best.ckpt`
 
 Run inference with
-
-`bash scripts/qvhl_inference_indomain.sh`
-`bash scripts/qvhl_inference_outofdomain.sh`
+```
+bash scripts/qvhl_inference_indomain.sh
+bash scripts/qvhl_inference_outofdomain.sh
+```
 
 for in-domain and out-of-domain respectively.
 
