@@ -1,0 +1,294 @@
+import os
+import pdb
+import sys
+import time
+import json
+import pprint
+import random
+import numpy as np
+from tqdm import tqdm, trange
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+from config import BaseOptions, BaseOptionsNeg, setup_model
+from dataset import \
+    DatasetMR, DatasetMRNeg, DatasetMRPos, start_end_collate_mr, prepare_batch_inputs_mr
+from inference_mr import eval_epoch, start_inference
+from utils.basic_utils import set_seed, AverageMeter, dict_to_markdown
+from utils.model_utils import count_parameters
+
+# np.seterr(divide='ignore', invalid='ignore')
+import warnings
+warnings.filterwarnings("ignore")
+torch.cuda.set_device(1)
+# import torch.multiprocessing
+# torch.multiprocessing.set_sharing_strategy('file_system')
+import logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(format="%(asctime)s.%(msecs)03d:%(levelname)s:%(name)s - %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                    level=logging.INFO)
+
+def train_epoch(model, criterion, train_pos_loader, train_neg_loader, optimizer, opt, epoch_i, tb_writer):
+    logger.info(f"[Epoch {epoch_i+1}]")
+    model.train()
+    criterion.train()
+
+    # init meters
+    time_meters = defaultdict(AverageMeter)
+    loss_meters = defaultdict(AverageMeter)
+
+
+    num_training_examples = len(train_pos_loader)
+    timer_dataloading = time.time()
+    for batch_idx, batch in tqdm(enumerate(train_pos_loader),
+                                 desc="Training Iteration",
+                                 total=num_training_examples):
+
+        neg_batch = next(iter(train_neg_loader))
+
+        time_meters["dataloading_time"].update(time.time() - timer_dataloading)
+
+        timer_start = time.time()
+        model_pos_inputs, targets_pos = prepare_batch_inputs_mr(batch[1], opt.device, non_blocking=opt.pin_memory)
+        model_neg_inputs, targets_neg = prepare_batch_inputs_mr(neg_batch[1], opt.device, non_blocking=opt.pin_memory)
+        time_meters["prepare_inputs_time"].update(time.time() - timer_start)
+
+        timer_start = time.time()
+
+        outputs_pos = model(**model_pos_inputs)
+        loss_pos_dict = criterion(outputs_pos, targets_pos)
+        weight_dict = criterion.weight_dict
+        losses_pos = sum(loss_pos_dict[k] * weight_dict[k] for k in loss_pos_dict.keys() if k in weight_dict)
+
+        outputs_neg = model(**model_neg_inputs)
+        loss_neg_dict = criterion(outputs_neg, targets_neg)
+        loss_neg_dict["loss_b"] = loss_neg_dict["loss_b"] * 0
+        loss_neg_dict["loss_g"] = loss_neg_dict["loss_g"] * 0
+        weight_dict = criterion.weight_dict
+        losses_neg = sum(loss_neg_dict[k] * weight_dict[k] for k in loss_neg_dict.keys() if k in weight_dict)
+        time_meters["model_forward_time"].update(time.time() - timer_start)
+
+        losses = losses_pos + losses_neg
+
+        timer_start = time.time()
+        optimizer.zero_grad()
+        losses.backward()
+
+        if opt.grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
+        optimizer.step()
+        time_meters["model_backward_time"].update(time.time() - timer_start)
+
+        loss_pos_dict["pos_loss_overall"] = float(losses_pos)  # for logging only
+        loss_neg_dict["neg_loss_overall"] = float(losses_neg)  # for logging only
+        loss_pos_dict["total_loss"] = float(losses) # for logging only
+        for k, v in loss_pos_dict.items():
+            loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
+
+        for k, v in loss_neg_dict.items():
+            loss_meters['neg_' + k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
+
+        timer_dataloading = time.time()
+
+    # print/add logs
+    tb_writer.add_scalar("Train/lr", float(optimizer.param_groups[0]["lr"]), epoch_i+1)
+    for k, v in loss_meters.items():
+        tb_writer.add_scalar("Train/{}".format(k), v.avg, epoch_i+1)
+
+    to_write = opt.train_log_txt_formatter.format(
+        time_str=time.strftime("%Y_%m_%d_%H_%M_%S"),
+        epoch=epoch_i+1,
+        loss_str=" ".join(["{} {:.4f}".format(k, v.avg) for k, v in loss_meters.items()]))
+    with open(opt.train_log_filepath, "a") as f:
+        f.write(to_write)
+
+    logger.info("Epoch time stats:")
+    for name, meter in time_meters.items():
+        d = {k: f"{getattr(meter, k):.4f}" for k in ["max", "min", "avg"]}
+        logger.info(f"{name} ==> {d}")
+
+
+def train(model, criterion, optimizer, lr_scheduler, train_pos_dataset, train_neg_dataset, val_dataset, val_neg_dataset, opt):
+    tb_writer = SummaryWriter(opt.tensorboard_log_dir)
+    tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
+    opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
+    opt.eval_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str} [Metrics] {eval_metrics_str}\n"
+
+    train_pos_loader = DataLoader(
+        train_pos_dataset,
+        collate_fn=start_end_collate_mr,
+        batch_size=opt.bsz,
+        num_workers=opt.num_workers,
+        shuffle=True,
+        pin_memory=opt.pin_memory
+    )
+
+    train_neg_loader = DataLoader(
+        train_neg_dataset,
+        collate_fn=start_end_collate_mr,
+        batch_size=opt.bsz,
+        num_workers=opt.num_workers,
+        shuffle=True,
+        pin_memory=opt.pin_memory
+    )
+
+    prev_best_score = 0.
+    es_cnt = 0
+    if opt.start_epoch is None:
+        start_epoch = -1 if opt.eval_init else 0
+    else:
+        start_epoch = opt.start_epoch
+    save_submission_filename = "latest_{}_{}_preds.jsonl".format(opt.dset_name, opt.eval_split_name)
+    for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
+        if epoch_i > -1:
+            train_epoch(model, criterion, train_pos_loader, train_neg_loader, optimizer, opt, epoch_i, tb_writer)
+            lr_scheduler.step()
+        eval_epoch_interval = opt.eval_epoch
+        if opt.eval_path is not None and (epoch_i + 1) % eval_epoch_interval == 0:
+            with torch.no_grad():
+                metrics_no_nms, metrics_nms, eval_loss_meters, latest_file_paths \
+                    = eval_epoch(model, val_dataset, opt, save_submission_filename, epoch_i, criterion, tb_writer)
+
+    tb_writer.close()
+
+
+def start_training():
+    logger.info("Setup config, data and model...")
+    opt = BaseOptions().parse()
+    set_seed(opt.seed)
+    if opt.debug:  # keep the model run deterministically
+        # 'cudnn.benchmark = True' enabled auto finding the best algorithm for a specific input/net config.
+        # Enable this only when input size is fixed.
+        cudnn.benchmark = False
+        cudnn.deterministic = True
+
+    train_dataset_config = dict(
+        dset_name=opt.dset_name,
+        pos_train_path=opt.pos_train_path,
+        neg_train_path=opt.neg_train_path,
+        neg_indomain_train_path=opt.neg_train_path,
+        v_feat_dirs=opt.v_feat_dirs,
+        q_feat_dir=opt.t_feat_dir,
+        v_feat_dim=opt.v_feat_dim,
+        q_feat_dim=opt.t_feat_dim,
+        q_feat_type="last_hidden_state",
+        max_q_l=opt.max_q_l,
+        max_v_l=opt.max_v_l,
+        ctx_mode=opt.ctx_mode,
+        data_ratio=opt.data_ratio,
+        normalize_v=not opt.no_norm_vfeat,
+        normalize_t=not opt.no_norm_tfeat,
+        clip_len=opt.clip_length,
+        max_windows=opt.max_windows,
+        span_loss_type=opt.span_loss_type,
+        txt_drop_ratio=opt.txt_drop_ratio,
+        use_cache=opt.use_cache,
+        add_easy_negative=opt.add_easy_negative,
+        easy_negative_only=opt.easy_negative_only
+    )
+
+    eval_dataset_config = dict(
+        dset_name=opt.dset_name,
+        data_path=opt.eval_path,
+        v_feat_dirs=opt.v_feat_dirs,
+        q_feat_dir=opt.t_feat_dir,
+        v_feat_dim=opt.v_feat_dim,
+        q_feat_dim=opt.t_feat_dim,
+        q_feat_type="last_hidden_state",
+        max_q_l=opt.max_q_l,
+        max_v_l=opt.max_v_l,
+        ctx_mode=opt.ctx_mode,
+        data_ratio=opt.data_ratio,
+        normalize_v=not opt.no_norm_vfeat,
+        normalize_t=not opt.no_norm_tfeat,
+        clip_len=opt.clip_length,
+        max_windows=opt.max_windows,
+        span_loss_type=opt.span_loss_type,
+        txt_drop_ratio=opt.txt_drop_ratio,
+        use_cache=opt.use_cache,
+        add_easy_negative=opt.add_easy_negative,
+        easy_negative_only=opt.easy_negative_only
+    )
+
+    eval_neg_dataset_config = dict(
+        dset_name=opt.dset_name,
+        pos_train_path=opt.eval_path,
+        neg_train_path=opt.neg_eval_path,
+        neg_indomain_train_path=opt.neg_eval_path,
+        v_feat_dirs=opt.v_feat_dirs,
+        q_feat_dir=opt.t_feat_dir,
+        v_feat_dim=opt.v_feat_dim,
+        q_feat_dim=opt.t_feat_dim,
+        q_feat_type="last_hidden_state",
+        max_q_l=opt.max_q_l,
+        max_v_l=opt.max_v_l,
+        ctx_mode=opt.ctx_mode,
+        data_ratio=opt.data_ratio,
+        normalize_v=not opt.no_norm_vfeat,
+        normalize_t=not opt.no_norm_tfeat,
+        clip_len=opt.clip_length,
+        max_windows=opt.max_windows,
+        span_loss_type=opt.span_loss_type,
+        txt_drop_ratio=opt.txt_drop_ratio,
+        use_cache=opt.use_cache,
+        add_easy_negative=opt.add_easy_negative,
+        easy_negative_only=opt.easy_negative_only
+    )
+
+    train_dataset_config["pos_train_path"] = opt.pos_train_path
+    train_dataset_config["neg_train_path"] = opt.neg_train_path
+    train_pos_dataset = DatasetMRPos(**train_dataset_config)
+    train_neg_dataset = DatasetMRNeg(**train_dataset_config)
+
+    if opt.eval_path is not None:
+        eval_dataset_config["data_path"] = opt.eval_path
+        eval_dataset_config["txt_drop_ratio"] = 0
+        eval_dataset_config["q_feat_dir"] = opt.t_feat_dir.replace("txt_clip_asr", "txt_clip").replace("txt_clip_cap", "txt_clip")  # for pretraining
+        # dataset_config["load_labels"] = False  # uncomment to calculate eval loss
+        eval_dataset = DatasetMR(**eval_dataset_config)
+    else:
+        eval_dataset = None
+
+    if opt.neg_eval_path is not None:
+        eval_neg_dataset_config["neg_train_path"] = opt.neg_eval_path
+        eval_neg_dataset_config["pos_train_path"] = opt.pos_train_path
+        eval_neg_dataset_config["txt_drop_ratio"] = 0
+        eval_neg_dataset_config["q_feat_dir"] = opt.t_feat_dir.replace("txt_clip_asr", "txt_clip").replace("txt_clip_cap", "txt_clip")  # for pretraining
+        # dataset_config["load_labels"] = False  # uncomment to calculate eval loss
+        eval_neg_dataset = DatasetMRNeg(**eval_neg_dataset_config)
+    else:
+        eval_neg_dataset = None
+
+    if opt.lr_warmup > 0:
+        # total_steps = opt.n_epoch * len(train_dataset) // opt.bsz
+        total_steps = opt.n_epoch
+        warmup_steps = opt.lr_warmup if opt.lr_warmup > 1 else int(opt.lr_warmup * total_steps)
+        opt.lr_warmup = [warmup_steps, total_steps]
+    model, criterion, optimizer, lr_scheduler = setup_model(opt)
+    logger.info(f"Model {model}")
+    count_parameters(model)
+    logger.info("Start Training...")
+    print('eval neg dataset', eval_neg_dataset)
+    train(model, criterion, optimizer, lr_scheduler, train_pos_dataset, train_neg_dataset, eval_dataset, eval_neg_dataset, opt)
+    return opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"), opt.eval_split_name, opt.eval_path, opt.debug
+
+
+if __name__ == '__main__':
+    best_ckpt_path, eval_split_name, eval_path, debug = start_training()
+    if not debug:
+        input_args = ["--resume", best_ckpt_path,
+                      "--eval_split_name", eval_split_name,
+                      "--eval_path", eval_path]
+
+        import sys
+        sys.argv[1:] = input_args
+        logger.info("\n\n\nFINISHED TRAINING!!!")
+        logger.info("Evaluating model at {}".format(best_ckpt_path))
+        logger.info("Input args {}".format(sys.argv[1:]))
+        # start_inference()
