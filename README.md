@@ -1,4 +1,4 @@
-# Moment of Untruth
+# Moment of Untruth: Dealing with Negative Queries in Video Moment Retrieval
 
 *Accepted at WACV 2025*
 
