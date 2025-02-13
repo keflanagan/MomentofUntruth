@@ -1,5 +1,9 @@
 # Moment of Untruth
 
+*Accepted at WACV 2025*
+
+[Project webpage](https://keflanagan.github.io/Moment-of-Untruth)
+
 Under the Negative-Aware Video Moment Retrieval task, UniVTG-NA allows for the rejection of negative queries while retaining much of its moment retrieval performance. 
 
 ## Data
