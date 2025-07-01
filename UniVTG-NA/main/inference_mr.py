@@ -20,6 +20,7 @@ from utils.basic_utils import save_jsonl, save_json
 from utils.temporal_nms import temporal_nms
 from utils.span_utils import span_cxw_to_xx
 
+import os
 import logging
 import importlib
 
@@ -39,6 +40,8 @@ def post_processing_mr_nms(mr_res, nms_thd, max_before_nms, max_after_nms, opt):
         mr_res_after_nms.append(e)
     pred_dict = {}
     pred_dict['preds'] = mr_res_after_nms
+    if not os.path.exists(os.path.split(opt.pred_save_path[0])[0]):
+        os.makedirs(os.path.split(opt.pred_save_path[0])[0])
     with open(opt.pred_save_path[0], 'w') as f:
         json.dump(pred_dict, f)
     return mr_res_after_nms

@@ -22,11 +22,11 @@ Place and extract into `UniVTG-NA/data/{dataset}`
 
 hdf5 files for faster dataloading may be generated with `data/create_h5py.py`
 
-Place the hdf5 feature files (`txt_clip.hdf5`, `vid_slowfast.hdf5`, `vid_clip.hdf5`) in `UniVTG-NA/data/h5py/{dataset}`
+Place the hdf5 feature files (`txt_clip.hdf5`, `vid_slowfast.hdf5`, `vid_clip.hdf5`) in `UniVTG-NA/data/{dataset}/h5py`
 
 ## Preparation
 
-Set up an environment and install dependencies with 
+Set up an environment and install dependencies from the `UniVTG-NA` directory with 
 
 ```
 pip install -r requirements.txt

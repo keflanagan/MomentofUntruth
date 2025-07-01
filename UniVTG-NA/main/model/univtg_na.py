@@ -132,7 +132,6 @@ class Model(nn.Module):
         vid_mem = memory[:, :src_vid.shape[1], :]  # (bsz, L_vid, d)
 
         outputs_class = self.class_embed(vid_mem).sigmoid()  # (#layers, batch_size, #queries, #classes)
-        # print(self.class_embed(vid_mem))
         outputs_coord = self.span_embed(vid_mem)  # (#layers, bsz, #queries, 2 or max_v_l * 2)
 
         if self.span_loss_type == "l1":
@@ -159,16 +158,8 @@ class Model(nn.Module):
             out["cls_mem_proj"] = cls_mem_proj
         out["saliency_scores"] = sim
 
-        # positive/negative classification
-        # print(self.class_embed.size())
-        # print('outputs_class', outputs_class.size())
-        # print('sim', sim.size())
-        # print(torch.squeeze(outputs_class, -1).size())
-        # print('src vid mask', src_vid_mask.size())
         classification_input = torch.squeeze(outputs_class, -1) + sim
         classification_input = classification_input * src_vid_mask
-        # print(src_vid_mask)
-        # print(classification_input)
         classification_input = torch.unsqueeze(classification_input, -1)
         lstm_out, h_n = self.lstm(classification_input)
         pred_class = self.class_layer(lstm_out[:, -1, :]).sigmoid()
@@ -225,85 +216,46 @@ class SetCriterion(nn.Module):
         mask_full = targets['timestamp_mask'].unsqueeze(2).repeat(1, 1, 2)
         mask_valid =  targets['timestamp_window'].bool()
         mask_valid_full = targets['timestamp_window'].unsqueeze(2).repeat(1, 1, 2)
-        # try except added by Kevin to deal with case for negatives where mask_valid is all 0s
-        # try:
-        # print(mask_valid.sum())
         loss_span = F.smooth_l1_loss(src_spans, gt_spans, reduction='none') * mask_valid_full
-        if mask_valid.sum() == 0: # added by Kevin to stop error in calculating these losses (which get set to 0 anyway later)
-            # print(mask_valid[0])
+        if mask_valid.sum() == 0: # added to stop error in calculating these losses (which get set to 0 anyway later)
             mask_valid[:, 0] = True
-            # print(mask_valid[0])
-        # print(mask_valid)
         loss_giou = 1 - torch.diag(generalized_temporal_iou(src_spans[mask_valid], gt_spans[mask_valid]))
         
         losses = {}
         losses['loss_b'] = loss_span.sum() / mask_valid.sum()
         losses['loss_g'] = loss_giou.mean()
-        # except:
-        #     losses = {}
-        #     losses['loss_b'] = 0
-        #     losses['loss_g'] = 0
         return losses
 
     def loss_labels(self, outputs, targets, indices, log=True):
         src_logits = outputs['pred_logits'].squeeze(-1)  # (batch_size, #queries, #classes=2)
         mask = targets['timestamp_mask'].bool()
         mask_valid = targets['timestamp_window'].bool()
-        # print(targets['timestamp_window'])
         target_classes = torch.full(src_logits.shape[:2], 0, dtype=torch.int64, device=src_logits.device)  # (batch_size, #queries)
-        # print(target_classes)
         target_classes[mask_valid] = 1
-        # target_classes = targets['timestamp_window']  # soft cls.
-        # print(target_classes)
         target_classes.float()
-        # pdb.set_trace()
 
         weights = torch.zeros_like(target_classes).float()
         weights[mask] = self.empty_weight[1]
         weights[mask_valid] = self.empty_weight[0]
-        # print(weights)
-        # pdb.set_trace()
-        # print(mask.sum())
-        # print(target_classes.float())
         loss_ce = F.binary_cross_entropy(src_logits, target_classes.float(), weight=weights,  reduction="none") * mask
-        # print(loss_ce.size())
-        # print('mask', mask)
-        # print(mask_valid)
         return {"loss_f": loss_ce.sum() / mask.sum()}
-        # return {"loss_f": loss_ce.sum() / (1 + mask_valid.sum())}
 
     def loss_class(self, outputs, targets, indices, log=True):
         src_logits = outputs['pred_logits'].squeeze(-1)
         mask = targets['timestamp_mask'].bool()
         mask_valid = targets['timestamp_window'].bool()
-        # print(targets['timestamp_window'])
         target_classes = torch.full(src_logits.shape[:2], 0, dtype=torch.int64,
                                     device=src_logits.device)  # (batch_size, #queries)
-        # print(target_classes)
         target_classes[mask_valid] = 1
-
-        # print('target classes', target_classes)
 
         target_sums = target_classes.sum(1)
         class_labels = (target_sums > 0).float()
         class_labels = torch.unsqueeze(class_labels, -1)
-        # print('class_labels', class_labels)
-
-        # if target_classes.sum() == 0:
-        #     class_label = torch.tensor(0)
-        # else:
-        #     class_label = torch.tensor(1)
 
         pred_class = outputs["pred_class"]
 
-        # print('pred_class', pred_class)
-        # print('class label', class_labels)
-        # print(pred_class.size(), class_labels.size())
-
         loss_ce = F.binary_cross_entropy(pred_class, class_labels, reduction="none")
-        # print('loss size', loss_ce.size()[0])
         avg_loss_ce = loss_ce.sum() / loss_ce.size()[0]
-        # print('loss_c', avg_loss_ce)
 
         return {"loss_c": avg_loss_ce}
 
@@ -313,21 +265,11 @@ class SetCriterion(nn.Module):
             return {"loss_s_inter": 0., "loss_s_intra": 0.}
         saliency_scores = targets["saliency_scores"]
         if saliency_scores.sum() == 0:
-            # return {"loss_s_inter": 0., "loss_s_intra": 0.}
             vid_mem_proj = outputs["vid_mem_proj"]
-            # # pos_indices = targets["saliency_pos_labels"][:, 0].long()  # (N, #pairs)
-            # batch_indices = torch.arange(len(vid_mem_proj)).to(vid_mem_proj.device)
-            #
-            # vid_feats = vid_mem_proj[batch_indices, :]
-            # print('vid feats size', vid_feats.size())
             txt_feats = outputs["txt_mem_proj"].squeeze(1)
-            # sim = sim_matrix(vid_feats, txt_feats)
-            # print('sim', sim)
             sim_in = F.cosine_similarity(vid_mem_proj, txt_feats.unsqueeze(1), dim=-1)
-            # print('sim in size', sim_in[0])
             avg_sim_in = torch.mean(sim_in, dim=1)
             batch_sim_loss = avg_sim_in.sum() / len(avg_sim_in)
-            # print('batch sim loss', batch_sim_loss)
             return {"loss_s_inter": 0., "loss_s_intra": batch_sim_loss}
 
 
@@ -337,7 +279,6 @@ class SetCriterion(nn.Module):
         batch_indices = torch.arange(len(vid_mem_proj)).to(vid_mem_proj.device)
 
         vid_feats = vid_mem_proj[batch_indices, pos_indices]
-        # print('vid feats size', vid_feats.size())
         txt_feats = outputs["txt_mem_proj"].squeeze(1)
         sim = sim_matrix(vid_feats, txt_feats)
 
